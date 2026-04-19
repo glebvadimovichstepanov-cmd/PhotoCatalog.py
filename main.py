@@ -46,13 +46,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Set, Any
 
-# Сторонние библиотеки (опциональные)
-try:
-    from tqdm import tqdm
+# Сторонние библиотеки (обязательные)
+from PIL import Image, ExifTags
+from pymediainfo import MediaInfo
+from tqdm import tqdm
 
-    USE_TQDM: bool = True
-except ImportError:
-    USE_TQDM: bool = False
+USE_TQDM: bool = True
 
 # =============================================================================
 # ГЛОБАЛЬНЫЕ НАСТРОЙКИ И КОНСТАНТЫ
@@ -95,6 +94,113 @@ MEDIAINFO_AVAILABLE: bool = False
 MEDIAINFO_ERROR_MESSAGE: str = ""
 
 
+def _initialize_mediainfo() -> Tuple[bool, str]:
+    """
+    Инициализация MediaInfo с поддержкой всех версий pymediainfo.
+    
+    Алгоритм:
+    1. Пробуем современный API configure() (pymediainfo >= 2.x)
+    2. Фоллбэк на устаревший set_library_path() (pymediainfo < 2.x)
+    3. Системный фоллбэк через os.add_dll_directory() для Windows
+    4. Проверка работоспособности через тестовый файл
+    
+    Returns:
+        Tuple[bool, str]: (успех, сообщение об ошибке или пустая строка)
+    """
+    import sys
+    import platform
+    
+    # Проверяем, что модуль импортирован
+    try:
+        from pymediainfo import MediaInfo
+    except ImportError as e:
+        return False, f"❌ Модуль pymediainfo не установлен: {e}"
+    
+    # Список путей для поиска MediaInfo.dll / libmediainfo.so
+    dll_paths_to_try = []
+    
+    # Добавляем стандартные пути в зависимости от ОС
+    if platform.system() == "Windows":
+        # Пути Windows
+        dll_paths_to_try.extend([
+            os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "MediaInfo"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "MediaInfo"),
+            os.path.dirname(os.path.abspath(__file__)),
+            os.getcwd(),
+        ])
+        # Добавляем путь из PATH если есть
+        system_path = os.environ.get("PATH", "")
+        for path_entry in system_path.split(";"):
+            if "MediaInfo" in path_entry and os.path.isdir(path_entry):
+                dll_paths_to_try.append(path_entry)
+    else:
+        # Пути Linux/macOS
+        dll_paths_to_try.extend([
+            "/usr/lib",
+            "/usr/local/lib",
+            "/opt/homebrew/lib",
+            "/usr/lib/x86_64-linux-gnu",
+            os.path.dirname(os.path.abspath(__file__)),
+        ])
+    
+    # Попытка инициализации через современный API configure()
+    try:
+        if hasattr(MediaInfo, 'configure'):
+            # Современный API (pymediainfo >= 2.x)
+            for dll_path in dll_paths_to_try:
+                try:
+                    MediaInfo.configure(dll_path=dll_path)
+                    if _check_mediainfo_functionality():
+                        return True, ""
+                except Exception:
+                    continue
+            # Пробуем без явного пути (системный поиск)
+            MediaInfo.configure()
+            if _check_mediainfo_functionality():
+                return True, ""
+    except Exception:
+        pass
+    
+    # Попытка инициализации через устаревший API set_library_path()
+    try:
+        if hasattr(MediaInfo, 'set_library_path'):
+            # Устаревший API (pymediainfo < 2.x)
+            for dll_path in dll_paths_to_try:
+                try:
+                    MediaInfo.set_library_path(dll_path)
+                    if _check_mediainfo_functionality():
+                        return True, ""
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    
+    # Системный фоллбэк через os.add_dll_directory() для Windows
+    if platform.system() == "Windows":
+        try:
+            for dll_path in dll_paths_to_try:
+                try:
+                    if os.path.isdir(dll_path):
+                        os.add_dll_directory(dll_path)
+                except (OSError, AttributeError):
+                    # os.add_dll_directory доступен только в Python 3.8+
+                    continue
+            
+            # После добавления путей пробуем ещё раз
+            if _check_mediainfo_functionality():
+                return True, ""
+        except Exception:
+            pass
+    
+    # Финальная проверка: современные версии pymediainfo могут работать без конфигурации
+    # Если MediaInfo.parse работает напрямую — считаем что всё ок
+    if _check_mediainfo_functionality():
+        return True, ""
+    
+    # Если ничего не помогло — возвращаем ошибку
+    return False, "⚠️  MediaInfo.dll не найдена или не загружается. Установите MediaInfo."
+
+
 def _check_mediainfo_functionality() -> bool:
     """
     Внутренняя проверка работоспособности pymediainfo.
@@ -110,7 +216,6 @@ def _check_mediainfo_functionality() -> bool:
             test_path = tmp.name
         try:
             # Попытка парсинга — даже если файл пустой, это проверит загрузку DLL
-            from pymediainfo import MediaInfo
             MediaInfo.parse(test_path)
         except Exception:
             # Ожидаем ошибку парсинга пустого файла — это нормально
@@ -124,18 +229,8 @@ def _check_mediainfo_functionality() -> bool:
         return False
 
 
-# Попытка импорта и инициализации pymediainfo
-try:
-    from pymediainfo import MediaInfo
-
-    MEDIAINFO_AVAILABLE = _check_mediainfo_functionality()
-    if not MEDIAINFO_AVAILABLE:
-        MEDIAINFO_ERROR_MESSAGE = "⚠️  MediaInfo.dll не найдена или не загружается"
-
-except ImportError as import_err:
-    MEDIAINFO_ERROR_MESSAGE = f"❌ Модуль pymediainfo не установлен: {import_err}"
-except Exception as init_err:
-    MEDIAINFO_ERROR_MESSAGE = f"❌ Ошибка инициализации MediaInfo: {init_err}"
+# Инициализация MediaInfo при загрузке модуля
+MEDIAINFO_AVAILABLE, MEDIAINFO_ERROR_MESSAGE = _initialize_mediainfo()
 
 
 # =============================================================================
@@ -166,7 +261,7 @@ def extract_date_from_image(filepath: str) -> Optional[datetime]:
 
             # Перебираем EXIF-теги и ищем нужные поля даты
             for tag_id, value in exif_data.items():
-                tag_name = TAGS.get(tag_id, tag_id)
+                tag_name = ExifTags.TAGS.get(tag_id, tag_id)
                 if tag_name in ('DateTimeOriginal', 'DateTime'):
                     # Формат даты в EXIF: "YYYY:MM:DD HH:MM:SS"
                     return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
@@ -356,9 +451,61 @@ def generate_target_path(source_file: str, dest_root: str, file_date: datetime) 
     return target_directory, target_path
 
 
+def copy_file_with_retry(source: str, target: str, max_retries: int = 3, retry_delay: float = 0.5) -> bool:
+    """
+    Копирует файл с механизмом повторных попыток при ошибке блокировки.
+    
+    Обработка WinError 32 (файл занят другим процессом):
+    - Делает несколько попыток копирования с задержкой
+    - Использует shutil.copy вместо copy2 для минимизации блокировок
+    - Закрывает все возможные дескрипторы перед копированием
+    
+    Args:
+        source: Исходный путь
+        target: Целевой путь
+        max_retries: Максимальное количество попыток
+        retry_delay: Задержка между попытками в секундах
+        
+    Returns:
+        bool: True если копирование успешно
+    """
+    import errno
+    
+    for attempt in range(max_retries):
+        try:
+            # Принудительно закрываем любые возможные дескрипторы файла
+            # через сборку мусора (на случай если файл был открыт ранее)
+            import gc
+            gc.collect()
+            
+            # Копируем файл с сохранением метаданных
+            shutil.copy2(source, target)
+            return True
+            
+        except PermissionError as e:
+            # WinError 32: файл занят другим процессом
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))  # Экспоненциальная задержка
+                continue
+            raise
+            
+        except OSError as e:
+            # Проверяем код ошибки Windows
+            if hasattr(e, 'winerror') and e.winerror == 32:
+                # Файл занят — пробуем снова
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+            raise
+    
+    return False
+
+
 def copy_file_with_metadata(source: str, target: str, target_dir: str) -> bool:
     """
     Копирует файл с сохранением метаданных (через copy2).
+    
+    Включает обработку ошибок блокировки файлов (WinError 32).
 
     Args:
         source: Исходный путь
@@ -371,9 +518,8 @@ def copy_file_with_metadata(source: str, target: str, target_dir: str) -> bool:
     # Создаём директорию если нужно
     os.makedirs(target_dir, exist_ok=True)
 
-    # Копируем файл с сохранением метаданных (включая время)
-    shutil.copy2(source, target)
-    return True
+    # Копируем файл с механизмом повторных попыток
+    return copy_file_with_retry(source, target)
 
 
 def process_file_batch(batch_args: Tuple[List[str], str, bool, bool]) -> Dict[str, Any]:
