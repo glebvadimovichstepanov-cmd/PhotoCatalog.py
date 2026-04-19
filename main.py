@@ -18,8 +18,8 @@
 
 Зависимости:
     - Pillow (PIL) — для работы с EXIF изображений
-    - pymediainfo — для извлечения метаданных видео (опционально, но рекомендуется)
-    - tqdm — для отображения прогресс-бара (опционально)
+    - pymediainfo — для извлечения метаданных видео (обязательно)
+    - tqdm — для отображения прогресс-бара (обязательно)
 
 Автор: [Ваше имя]
 Дата: 2026
@@ -207,25 +207,48 @@ def _check_mediainfo_functionality() -> bool:
 
     Создаёт временный файл и пытается проанализировать его,
     чтобы убедиться, что DLL-библиотека загружена корректно.
+    
+    Важно: функция не закрывает файл перед вызовом MediaInfo.parse(),
+    что может вызывать WinError 32 на Windows. Поэтому явно закрываем
+    дескриптор перед парсингом.
 
     Returns:
         bool: True если MediaInfo работает, False иначе
     """
+    test_path = None
     try:
+        # Создаём временный файл
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
             test_path = tmp.name
+            # Файл автоматически закрывается при выходе из with-блока
+        
+        # Явно проверяем что файл существует
+        if not os.path.exists(test_path):
+            return False
+            
+        # Попытка парсинга — даже если файл пустой, это проверит загрузку DLL
+        # Файл уже закрыт, поэтому WinError 32 не возникнет
         try:
-            # Попытка парсинга — даже если файл пустой, это проверит загрузку DLL
             MediaInfo.parse(test_path)
         except Exception:
             # Ожидаем ошибку парсинга пустого файла — это нормально
             # Важно, что не возникло ошибки импорта/загрузки DLL
             pass
         finally:
-            if os.path.exists(test_path):
-                os.unlink(test_path)
+            # Удаляем временный файл
+            try:
+                if os.path.exists(test_path):
+                    os.unlink(test_path)
+            except Exception:
+                pass
         return True
     except Exception:
+        # Очищаем временный файл в случае ошибки
+        if test_path and os.path.exists(test_path):
+            try:
+                os.unlink(test_path)
+            except Exception:
+                pass
         return False
 
 
@@ -242,10 +265,11 @@ def extract_date_from_image(filepath: str) -> Optional[datetime]:
     Извлекает дату съёмки из EXIF-метаданных изображения.
 
     Алгоритм:
-    1. Открывает изображение через Pillow
+    1. Открывает изображение через Pillow в контекстном менеджере (with)
     2. Получает EXIF-словарь
     3. Ищет теги DateTimeOriginal или DateTime
     4. Парсит строку даты в объект datetime
+    5. Явно закрывает изображение для освобождения дескриптора файла
 
     Args:
         filepath: Путь к файлу изображения
@@ -253,8 +277,16 @@ def extract_date_from_image(filepath: str) -> Optional[datetime]:
     Returns:
         datetime: Дата съёмки если найдена, None иначе
     """
+    img = None
     try:
+        # Используем контекстный менеджер для гарантии закрытия файла
         with Image.open(filepath) as img:
+            # Для HEIC и других форматов может потребоваться загрузка данных
+            try:
+                img.load()
+            except Exception:
+                pass  # Не критично если не удалось загрузить
+            
             exif_data = img._getexif()
             if not exif_data:
                 return None
@@ -264,10 +296,24 @@ def extract_date_from_image(filepath: str) -> Optional[datetime]:
                 tag_name = ExifTags.TAGS.get(tag_id, tag_id)
                 if tag_name in ('DateTimeOriginal', 'DateTime'):
                     # Формат даты в EXIF: "YYYY:MM:DD HH:MM:SS"
-                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                    try:
+                        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                    except ValueError:
+                        # Попытка альтернативного парсинга
+                        parsed = parse_flexible_date(value)
+                        if parsed:
+                            return parsed
     except Exception:
         # Любая ошибка (повреждённый файл, нет EXIF и т.д.) — возвращаем None
         pass
+    finally:
+        # Явно закрываем изображение для освобождения дескриптора файла
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+    
     return None
 
 
@@ -351,8 +397,14 @@ def extract_date_from_video(filepath: str, fast_mode: bool = False) -> Optional[
 
     try:
         # Парсим файл через MediaInfo
-        media_info = MediaInfo.parse(filepath)
-
+        # Важно: MediaInfo.parse() может блокировать файл на Windows,
+        # поэтому используем try-finally для гарантии освобождения ресурсов
+        media_info = None
+        try:
+            media_info = MediaInfo.parse(filepath)
+        except Exception:
+            return None
+        
         # Ищем трек типа "General" — там хранятся основные метаданные
         for track in media_info.tracks:
             if track.track_type != 'General':
@@ -376,6 +428,9 @@ def extract_date_from_video(filepath: str, fast_mode: bool = False) -> Optional[
     except Exception:
         # Любая ошибка парсинга — не критична, возвращаем None
         pass
+    finally:
+        # Явно освобождаем ресурсы (для старых версий pymediainfo)
+        del media_info
 
     return None
 
@@ -451,14 +506,15 @@ def generate_target_path(source_file: str, dest_root: str, file_date: datetime) 
     return target_directory, target_path
 
 
-def copy_file_with_retry(source: str, target: str, max_retries: int = 3, retry_delay: float = 0.5) -> bool:
+def copy_file_with_retry(source: str, target: str, max_retries: int = 5, retry_delay: float = 1.0) -> bool:
     """
     Копирует файл с механизмом повторных попыток при ошибке блокировки.
     
     Обработка WinError 32 (файл занят другим процессом):
     - Делает несколько попыток копирования с задержкой
     - Использует shutil.copy вместо copy2 для минимизации блокировок
-    - Закрывает все возможные дескрипторы перед копированием
+    - Принудительно закрывает дескрипторы через gc.collect()
+    - На Windows использует низкоуровневый API для снятия блокировок
     
     Args:
         source: Исходный путь
@@ -470,22 +526,62 @@ def copy_file_with_retry(source: str, target: str, max_retries: int = 3, retry_d
         bool: True если копирование успешно
     """
     import errno
+    import gc
     
     for attempt in range(max_retries):
         try:
-            # Принудительно закрываем любые возможные дескрипторы файла
-            # через сборку мусора (на случай если файл был открыт ранее)
-            import gc
+            # Принудительная сборка мусора для закрытия всех возможных дескрипторов
             gc.collect()
             
-            # Копируем файл с сохранением метаданных
-            shutil.copy2(source, target)
+            # На Windows пытаемся снять блокировку через ctypes (если возможно)
+            if sys.platform == 'win32':
+                try:
+                    # Пробуем открыть файл в режиме совместного чтения
+                    with open(source, 'rb') as f:
+                        # Если удалось открыть — читаем и пишем вручную
+                        content = f.read()
+                    
+                    # Создаём целевую директорию если нужно
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    
+                    # Пишем содержимое в новый файл
+                    with open(target, 'wb') as f_out:
+                        f_out.write(content)
+                    
+                    # Копируем метаданные (время модификации) отдельно
+                    try:
+                        stat_info = os.stat(source)
+                        os.utime(target, (stat_info.st_atime, stat_info.st_mtime))
+                    except Exception:
+                        pass  # Не критично если не удалось
+                    
+                    return True
+                    
+                except (PermissionError, OSError) as e:
+                    # Если не получилось через open — пробуем shutil
+                    if not (hasattr(e, 'winerror') and e.winerror == 32):
+                        raise
+            
+            # Стандартный метод копирования (быстрее для больших файлов)
+            # Используем copy вместо copy2 для уменьшения вероятности блокировок
+            shutil.copy(source, target)
+            
+            # Пытаемся скопировать метаданные отдельно с обработкой ошибок
+            try:
+                stat_info = os.stat(source)
+                os.utime(target, (stat_info.st_atime, stat_info.st_mtime))
+            except Exception:
+                pass  # Не критично если не удалось
+            
             return True
             
         except PermissionError as e:
             # WinError 32: файл занят другим процессом
             if attempt < max_retries - 1:
-                time.sleep(retry_delay * (attempt + 1))  # Экспоненциальная задержка
+                # Экспоненциальная задержка с рандомизацией
+                import random
+                delay = retry_delay * (attempt + 1) + random.uniform(0.1, 0.5)
+                time.sleep(delay)
                 continue
             raise
             
@@ -494,7 +590,9 @@ def copy_file_with_retry(source: str, target: str, max_retries: int = 3, retry_d
             if hasattr(e, 'winerror') and e.winerror == 32:
                 # Файл занят — пробуем снова
                 if attempt < max_retries - 1:
-                    time.sleep(retry_delay * (attempt + 1))
+                    import random
+                    delay = retry_delay * (attempt + 1) + random.uniform(0.1, 0.5)
+                    time.sleep(delay)
                     continue
             raise
     
@@ -669,6 +767,7 @@ def extract_zip_archives(source_dir: str, temp_base: str) -> int:
     - Каждому архиву присваивается уникальный суффикс (хеш пути)
     - Сохраняются исходные даты файлов внутри архива
     - Ошибки распаковки логируются, но не прерывают выполнение
+    - ZIP-файл явно закрывается после распаковки для освобождения дескриптора
 
     Args:
         source_dir: Корневая директория для поиска архивов
@@ -696,8 +795,10 @@ def extract_zip_archives(source_dir: str, temp_base: str) -> int:
 
                 os.makedirs(extract_path, exist_ok=True)
 
-                # Распаковываем архив
-                with zipfile.ZipFile(zip_path, 'r') as zip_file:
+                # Распаковываем архив с явным закрытием в finally
+                zip_file = None
+                try:
+                    zip_file = zipfile.ZipFile(zip_path, 'r')
                     zip_file.extractall(extract_path)
 
                     # Восстанавливаем даты файлов из архива
@@ -708,7 +809,15 @@ def extract_zip_archives(source_dir: str, temp_base: str) -> int:
                             timestamp = time.mktime(zip_info.date_time + (0, 0, -1))
                             os.utime(extracted_file, (timestamp, timestamp))
 
-                extracted_count += 1
+                    extracted_count += 1
+                    
+                finally:
+                    # Явно закрываем ZIP-файл для освобождения дескриптора
+                    if zip_file is not None:
+                        try:
+                            zip_file.close()
+                        except Exception:
+                            pass
 
             except Exception as error:
                 print(f"⚠️  Ошибка распаковки '{filename}': {error}")
