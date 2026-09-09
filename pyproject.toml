@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photocatalog"
+version = "2.1.0"
+description = "Non-destructive photo and video catalog for Windows"
+requires-python = ">=3.12"
+dependencies = ["Pillow>=12.3,<13"]
+
+[project.optional-dependencies]
+video = ["pymediainfo>=7.0.1,<8"]
+desktop = ["PySide6-Essentials>=6.11.2,<6.12", "pymediainfo>=7.0.1,<8"]
+test = ["pytest>=9.1,<10", "ruff>=0.16,<0.17"]
+
+[project.scripts]
+photocatalog = "photocatalog.cli:main"
+
+[project.gui-scripts]
+photocatalog-desktop = "photocatalog.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

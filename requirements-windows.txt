@@ -1,0 +1,4 @@
+# Tested Windows x64 / Python 3.12.14 runtime, including optional video support.
+Pillow==12.3.0
+pymediainfo==7.0.1
+
