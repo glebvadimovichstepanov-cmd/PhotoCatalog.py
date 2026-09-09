@@ -1,4 +1,11 @@
-```
 __pycache__/
 *.pyc
-```
+.idea/
+.venv/
+.pytest_cache/
+.pytest-local/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.env
