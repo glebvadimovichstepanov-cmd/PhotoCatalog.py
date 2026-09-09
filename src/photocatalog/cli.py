@@ -111,6 +111,8 @@ def main(argv: list[str] | None = None) -> int:
             print(" ".join(f"{key}={value}" for key, value in summary.counts.items()))
         if args.report:
             write_report(args.report, summary.json())
+        if summary.cancelled:
+            return 130
         return 1 if summary.counts["error"] else 0
     except KeyboardInterrupt:
         print(

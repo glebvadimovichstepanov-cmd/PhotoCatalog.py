@@ -5,10 +5,12 @@ import logging
 import os
 import tempfile
 import zipfile
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 
 from .archives import Limits, extract, members
 from .metadata import MEDIA_EXTENSIONS, read_date
@@ -44,6 +46,7 @@ class Record:
 @dataclass
 class Summary:
     records: list[Record] = field(default_factory=list)
+    cancelled: bool = False
 
     @property
     def counts(self) -> dict[str, int]:
@@ -55,7 +58,11 @@ class Summary:
     def json(self) -> str:
         return (
             json.dumps(
-                {"counts": self.counts, "records": [asdict(r) for r in self.records]},
+                {
+                    "counts": self.counts,
+                    "cancelled": self.cancelled,
+                    "records": [asdict(r) for r in self.records],
+                },
                 ensure_ascii=False,
                 indent=2,
             )
@@ -63,7 +70,12 @@ class Summary:
         )
 
 
-def run(config: Config) -> Summary:
+def run(
+    config: Config,
+    *,
+    progress: Callable[[Record], None] | None = None,
+    cancel: Event | None = None,
+) -> Summary:
     if not 1 <= config.workers <= 64 or config.batch_size < 1:
         raise ValueError("workers must be 1..64 and batch-size must be positive")
     config.limits.validate()
@@ -71,13 +83,21 @@ def run(config: Config) -> Summary:
     if config.library and not Path(config.library).is_file():
         raise ValueError(f"MediaInfo library does not exist: {config.library}")
     summary = Summary()
+    cancellation = cancel if cancel is not None else Event()
+
+    def emit(record: Record) -> None:
+        summary.records.append(record)
+        if progress is not None:
+            progress(record)
 
     def error(path: str, exc: Exception) -> None:
         LOG.error("%s: %s", path, exc)
-        summary.records.append(Record(path, "error", message=str(exc)))
+        emit(Record(path, "error", message=str(exc)))
 
     def process(item: tuple[Path, str]) -> Record:
         path, label = item
+        if cancellation.is_set():
+            return Record(label, "skipped", message="Cancelled before processing")
         try:
             date = read_date(path, config.fast_video, config.library)
             target = target_path(destination, path.name, date.value)
@@ -117,7 +137,7 @@ def run(config: Config) -> Summary:
                             "; Target collision: actual run will verify content "
                             "and skip a duplicate or choose a free name"
                         )
-                summary.records.append(record)
+                emit(record)
                 if record.status == "error":
                     LOG.error("%s: %s", record.source, record.message)
                 elif record.message:
@@ -139,7 +159,9 @@ def run(config: Config) -> Summary:
                                 and relative.suffix.lower() in MEDIA_EXTENSIONS
                             ):
                                 date = datetime(*info.date_time)
-                                summary.records.append(
+                                if cancellation.is_set():
+                                    break
+                                emit(
                                     Record(
                                         f"{path}!{info.filename}",
                                         "planned",
@@ -161,13 +183,22 @@ def run(config: Config) -> Summary:
                         with tempfile.TemporaryDirectory(
                             prefix="photocatalog-"
                         ) as folder:
-                            paths = extract(archive, Path(folder), config.limits)
+                            paths = extract(
+                                archive,
+                                Path(folder),
+                                config.limits,
+                                should_stop=cancellation.is_set,
+                            )
                             for extracted in paths:
+                                if cancellation.is_set():
+                                    break
                                 if extracted.suffix.lower() in MEDIA_EXTENSIONS:
                                     relative = extracted.relative_to(folder).as_posix()
                                     label = f"{path}!{relative}"
                                     enqueue(extracted, label)
                             flush()
+            except InterruptedError:
+                cancellation.set()
             except Exception as exc:
                 error(str(path), exc)
 
@@ -175,11 +206,13 @@ def run(config: Config) -> Summary:
             error(str(exc.filename or source), exc)
 
         for root, directories, filenames in os.walk(source, onerror=walk_error):
+            if cancellation.is_set():
+                break
             root_path = Path(root)
             for name in list(directories):
                 if is_link(root_path / name):
                     directories.remove(name)
-                    summary.records.append(
+                    emit(
                         Record(
                             str(root_path / name),
                             "skipped",
@@ -187,15 +220,16 @@ def run(config: Config) -> Summary:
                         )
                     )
             for name in sorted(filenames):
+                if cancellation.is_set():
+                    break
                 path = root_path / name
                 if is_link(path):
-                    summary.records.append(
-                        Record(str(path), "skipped", message="File link not followed")
-                    )
+                    emit(Record(str(path), "skipped", message="File link not followed"))
                 elif path.suffix.lower() in MEDIA_EXTENSIONS:
                     enqueue(path, str(path))
                 elif config.extract_zips and path.suffix.lower() == ".zip":
                     flush()
                     archive_job(path)
         flush()
+    summary.cancelled = cancellation.is_set()
     return summary

@@ -1,4 +1,40 @@
-# PhotoCatalog 2.0
+# PhotoCatalog 2.1
+
+![PhotoCatalog desktop](docs/desktop-preview.png)
+
+PhotoCatalog — локальный каталогизатор фотографий и видео для Windows с аккуратным графическим интерфейсом. Он раскладывает медиатеку по годам и дням, проверяет каждую копию по SHA-256 и сохраняет оригиналы на месте.
+
+![Интерфейс PhotoCatalog](docs/desktop-preview.png)
+
+## Что нового
+
+- Готовый `PhotoCatalog.exe`: Python, Qt, Pillow, pymediainfo и MediaInfo.dll внутри одного файла.
+- Предпросмотр без записи, прогресс, журнал результатов, остановка и экспорт JSON.
+- Разные файлы с одинаковым временем больше не перезаписываются.
+- Защита от ZIP traversal, ссылок, Windows-зарезервированных имён, ZIP-бомб и повреждённых архивов.
+- Тёмная боковая панель, светлая рабочая область и понятный сценарий из трёх шагов.
+
+## Быстрый старт
+
+1. Скачайте `PhotoCatalog.exe` из GitHub Releases и запустите двойным щелчком.
+2. Выберите источник и отдельную папку назначения.
+3. Нажмите «Предпросмотр», проверьте план, затем «Начать копирование».
+
+EXE не требует установленного Python. Приложение не использует облако и не отправляет фотографии в интернет.
+
+Для разработчиков сборка выполняется на Windows:
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+.venv\Scripts\python.exe -m pip install -e . --no-deps
+.venv\Scripts\python.exe tools/build_windows.py
+dist\PhotoCatalog.exe --self-test dist\self-test
+```
+
+`PhotoCatalog.exe.sha256` содержит контрольную сумму готового файла. Self-test запускает GUI в скрытом режиме, проверяет предпросмотр, копирование, повторный запуск, сохранность исходника и MediaInfo, затем создаёт `desktop-preview.png`. Для диагностики Self-test запускается с ключом `--self-test`; обычный запуск всегда показывает только окно приложения.
+
+Для командной строки остаётся `python -m photocatalog`; графическая команда после установки — `photocatalog-desktop`.
 
 Каталогизатор фото и видео для Windows, Python 3.12+. Проверенная среда: Windows x64, Python 3.12.14.
 

@@ -4,6 +4,7 @@ import os
 import re
 import stat
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -70,13 +71,21 @@ def members(
     return result
 
 
-def extract(archive: zipfile.ZipFile, destination: Path, limits: Limits) -> list[Path]:
+def extract(
+    archive: zipfile.ZipFile,
+    destination: Path,
+    limits: Limits,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> list[Path]:
     # Caller owns a fresh TemporaryDirectory and discards the entire archive
     # after any failure. Never scan partially extracted content.
     entries = members(archive, limits)
     total = 0
     paths = []
     for info, relative in entries:
+        if should_stop is not None and should_stop():
+            raise InterruptedError("Archive extraction cancelled")
         target = destination / relative
         if info.is_dir():
             target.mkdir(parents=True, exist_ok=True)
@@ -85,6 +94,8 @@ def extract(archive: zipfile.ZipFile, destination: Path, limits: Limits) -> list
         size = 0
         with archive.open(info) as source, target.open("xb") as output:
             while chunk := source.read(1024 * 1024):
+                if should_stop is not None and should_stop():
+                    raise InterruptedError("Archive extraction cancelled")
                 size += len(chunk)
                 total += len(chunk)
                 if size > info.file_size or total > limits.bytes:
